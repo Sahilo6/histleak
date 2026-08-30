@@ -505,13 +505,6 @@ def _looks_like_secret(token: str) -> bool:
     return shannon_entropy(token) >= _ENTROPY_MIN_BITS
 
 
-def scan_entropy(text: str) -> Iterator[str]:
-    for m in _ENTROPY_CANDIDATE.finditer(text):
-        token = m.group(0)
-        if _looks_like_secret(token):
-            yield token
-
-
 @dataclass
 class Finding:
     rule_id: str
