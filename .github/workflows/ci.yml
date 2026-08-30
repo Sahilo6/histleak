@@ -1,0 +1,55 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Dependency proof: nothing is installed, ever. There is no pip
+      # install step in this workflow at all.
+      - name: prove zero runtime dependencies
+        run: |
+          echo "requirements.txt:"
+          cat requirements.txt
+          test ! -s requirements.txt && echo "OK: requirements.txt is empty"
+          echo
+          echo "pip freeze in this environment (setup-python's default packages only):"
+          pip freeze
+          echo
+          echo "third-party imports in histleak.py (should be none):"
+          python3 - <<'PY'
+          import ast, sys
+          stdlib = sys.stdlib_module_names
+          tree = ast.parse(open("histleak.py").read())
+          bad = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for n in node.names:
+                      top = n.name.split(".")[0]
+                      if top not in stdlib:
+                          bad.append(top)
+              elif isinstance(node, ast.ImportFrom):
+                  if node.module:
+                      top = node.module.split(".")[0]
+                      if top not in stdlib:
+                          bad.append(top)
+          if bad:
+              print("NON-STDLIB IMPORTS FOUND:", bad)
+              sys.exit(1)
+          print("OK: every import in histleak.py resolves to the Python 3 standard library")
+          PY
+
+      - name: run tests
+        run: python3 -m unittest -v
+
+      - name: smoke test against own history
+        run: |
+          python3 histleak.py scan . || true
+          echo "exit code above is informational, not a failure condition"
