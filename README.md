@@ -100,10 +100,10 @@ built by hand through `zipfile` with a fixed timestamp on every entry instead of
 
 ```
 $ ./build.sh && ./build.sh
-wrote dist/histleak.pyz (11990 bytes)
-wrote dist/histleak.pyz (11990 bytes)
-53d41db4b87abbc7d343ba495130d97a3e3b704d4fdfa207fee24b463f1ef576  dist/histleak.pyz
-53d41db4b87abbc7d343ba495130d97a3e3b704d4fdfa207fee24b463f1ef576  dist/histleak.pyz
+wrote dist/histleak.pyz (12666 bytes)
+wrote dist/histleak.pyz (12666 bytes)
+87374cc5553450b41db207acda43b88838e0608f282ed64a90959972f0629b11  dist/histleak.pyz
+87374cc5553450b41db207acda43b88838e0608f282ed64a90959972f0629b11  dist/histleak.pyz
 ```
 
 ## Tests
@@ -112,7 +112,7 @@ wrote dist/histleak.pyz (11990 bytes)
 python3 -m unittest -v
 ```
 
-32 tests, no network, no `git` invoked at test time. `tests/fixtures/packed_git/` is a
+36 tests, no network, no `git` invoked at test time. `tests/fixtures/packed_git/` is a
 pre-built, `git gc`'d bare repo committed as test data -- see `tests/fixtures/README.md` for
 exactly how it was built and what it plants. `git` was used once, by a human, to build that
 fixture. It is never called by `histleak.py` or by the tests.

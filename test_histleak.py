@@ -289,5 +289,50 @@ class BoundedCacheTests(unittest.TestCase):
         self.assertIsNone(c.get("b"))
 
 
+class CommitOrderingTests(unittest.TestCase):
+    """Attribution must survive commits that share a timestamp.
+
+    Git timestamps have one-second resolution, so scripted commits,
+    rebases and repo imports routinely put several commits in the same
+    second. Sorting by timestamp alone let a child sort before its parent
+    and blamed the leak on the commit *after* the one that introduced it.
+    """
+
+    def test_generation_orders_parent_before_child(self):
+        commits = [
+            ("c3", {"parents": ["c2"], "ts": 100}),
+            ("c1", {"parents": [], "ts": 100}),
+            ("c2", {"parents": ["c1"], "ts": 100}),
+        ]
+        gen = histleak._commit_generations(commits)
+        self.assertLess(gen["c1"], gen["c2"])
+        self.assertLess(gen["c2"], gen["c3"])
+
+    def test_generation_handles_merge_commits(self):
+        commits = [
+            ("root", {"parents": [], "ts": 1}),
+            ("a", {"parents": ["root"], "ts": 2}),
+            ("b", {"parents": ["root"], "ts": 2}),
+            ("merge", {"parents": ["a", "b"], "ts": 3}),
+        ]
+        gen = histleak._commit_generations(commits)
+        self.assertGreater(gen["merge"], gen["a"])
+        self.assertGreater(gen["merge"], gen["b"])
+
+    def test_generation_tolerates_missing_parent(self):
+        # Shallow clones reference parents that are not in the object db.
+        commits = [("only", {"parents": ["absent"], "ts": 5})]
+        gen = histleak._commit_generations(commits)
+        self.assertIn("only", gen)
+
+    def test_generation_is_iterative_not_recursive(self):
+        # A long linear history must not blow the Python stack.
+        commits = [("c0", {"parents": [], "ts": 0})]
+        commits += [(f"c{i}", {"parents": [f"c{i-1}"], "ts": i})
+                    for i in range(1, 5000)]
+        gen = histleak._commit_generations(commits)
+        self.assertEqual(gen["c4999"], 4999)
+
+
 if __name__ == "__main__":
     unittest.main()

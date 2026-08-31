@@ -754,6 +754,37 @@ def parse_tree(content: bytes) -> list[tuple[str, str, str]]:
     return entries
 
 
+def _commit_generations(commits: list[tuple[str, dict]]) -> dict[str, int]:
+    """Longest-path-from-a-root depth for each commit, computed iteratively.
+
+    Iterative rather than recursive: commit graphs are deep (tens of
+    thousands of commits in a linear history) and recursion would exhaust
+    the stack on exactly the repositories this tool is meant for.
+    """
+    info_by_sha = {sha: info for sha, info in commits}
+    generation: dict[str, int] = {}
+    for start, _ in commits:
+        if start in generation:
+            continue
+        stack = [start]
+        while stack:
+            sha = stack[-1]
+            info = info_by_sha.get(sha)
+            if info is None:          # parent outside this repo (shallow clone)
+                generation[sha] = 0
+                stack.pop()
+                continue
+            pending = [p for p in info["parents"]
+                       if p not in generation and p in info_by_sha]
+            if pending:
+                stack.extend(pending)
+                continue
+            known = [generation[p] for p in info["parents"] if p in generation]
+            generation[sha] = 1 + max(known) if known else 0
+            stack.pop()
+    return generation
+
+
 def attribute_blobs(store: ObjectStore, flagged: set[str]) -> dict[str, dict]:
     """For each flagged blob sha, find the earliest commit whose tree
     contains it, and the path it was found under."""
@@ -778,7 +809,18 @@ def attribute_blobs(store: ObjectStore, flagged: set[str]) -> dict[str, dict]:
         info = parse_commit(content)
         commits.append((csha, info))
         queue.extend(info["parents"])
-    commits.sort(key=lambda c: c[1]["ts"])
+    # Sorting by timestamp alone is not enough to find which commit
+    # *introduced* a blob: git timestamps have one-second resolution, and
+    # scripted commits, rebases, and imports routinely produce several
+    # commits sharing a second. When that happens the tie breaks
+    # arbitrarily and a child can sort before its own parent, attributing
+    # the leak to the commit after the one that actually added it.
+    #
+    # Generation number (longest path back to a root) is a topological
+    # tiebreak: a parent's generation is always strictly less than its
+    # child's, so (timestamp, generation) never inverts a real edge.
+    generation = _commit_generations(commits)
+    commits.sort(key=lambda c: (c[1]["ts"], generation[c[0]]))
 
     def walk(tree_sha: str, prefix: str, csha: str, info: dict):
         got = store.get(tree_sha)
