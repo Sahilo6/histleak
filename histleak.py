@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import fnmatch
 import json
 import math
@@ -611,7 +612,15 @@ class Finding:
     occurrences: int = 1  # how many distinct blobs carried this same secret
 
     def redacted(self) -> str:
+        """Show enough to identify the secret, never enough to use it.
+
+        PEM armor is exempt: "-----BEGIN RSA PRIVATE KEY-----" is a label,
+        not key material, and redacting it to "----…----" tells the reader
+        nothing about what was found.
+        """
         m = self.match
+        if m.startswith("-----BEGIN"):
+            return m
         if len(m) <= 8:
             return "*" * len(m)
         return m[:4] + "…" + m[-4:]
@@ -707,7 +716,6 @@ def scan_blob_text(text: str, path: str, blob_sha: str,
 # small set of blobs that actually produced a finding, to answer "which
 # commit introduced this, and under what path."
 
-import datetime as _datetime
 
 
 def parse_commit(content: bytes) -> dict:
@@ -728,7 +736,7 @@ def parse_commit(content: bytes) -> dict:
             if m:
                 author = f"{m.group(1)} <{m.group(2)}>"
                 ts = int(m.group(3))
-    date = _datetime.datetime.fromtimestamp(ts, tz=_datetime.timezone.utc).isoformat() if ts else None
+    date = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat() if ts else None
     return {"tree": tree, "parents": parents, "author": author, "date": date, "ts": ts}
 
 

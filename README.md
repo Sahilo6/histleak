@@ -100,10 +100,10 @@ built by hand through `zipfile` with a fixed timestamp on every entry instead of
 
 ```
 $ ./build.sh && ./build.sh
-wrote dist/histleak.pyz (11876 bytes)
-wrote dist/histleak.pyz (11876 bytes)
-c78961e97c926c3c435d0350a7cd81ec1592a91fb9025418ebb3a0cccf3790c4  dist/histleak.pyz
-c78961e97c926c3c435d0350a7cd81ec1592a91fb9025418ebb3a0cccf3790c4  dist/histleak.pyz
+wrote dist/histleak.pyz (11990 bytes)
+wrote dist/histleak.pyz (11990 bytes)
+53d41db4b87abbc7d343ba495130d97a3e3b704d4fdfa207fee24b463f1ef576  dist/histleak.pyz
+53d41db4b87abbc7d343ba495130d97a3e3b704d4fdfa207fee24b463f1ef576  dist/histleak.pyz
 ```
 
 ## Tests
