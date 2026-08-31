@@ -11,6 +11,8 @@ run time. It was built once with:
 See tests/fixtures/README.md for the exact commit sequence.
 """
 
+import contextlib
+import io
 import math
 import unittest
 from pathlib import Path
@@ -174,13 +176,48 @@ class ReportTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    """Exercises main() end to end.
+
+    Output is captured rather than allowed through: a test run that prints
+    a scan report interleaves findings with unittest's own output, which
+    makes a failure harder to spot and makes `python3 -m unittest` unusable
+    in a pipeline that greps its result.
+    """
+
+    def _run(self, argv) -> tuple[int, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = histleak.main(argv)
+        return rc, out.getvalue()
+
     def test_exit_code_1_on_findings(self):
-        rc = histleak.main(["scan", str(FIXTURE)])
+        rc, output = self._run(["scan", str(FIXTURE)])
         self.assertEqual(rc, 1)
+        self.assertIn("aws-access-key-id", output)
 
     def test_exit_code_2_on_missing_repo(self):
-        rc = histleak.main(["scan", "/nonexistent/path/for/sure"])
+        rc, _ = self._run(["scan", "/nonexistent/path/for/sure"])
         self.assertEqual(rc, 2)
+
+    def test_exit_code_0_on_clean_scan(self):
+        import tempfile, subprocess
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=d, check=True)
+            (Path(d) / "f.txt").write_text("nothing secret\n")
+            subprocess.run(["git", "add", "f.txt"], cwd=d, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "c1"], cwd=d, check=True)
+            rc, output = self._run(["scan", d])
+        self.assertEqual(rc, 0)
+        self.assertIn("no secrets found", output)
+
+    def test_json_output_is_valid_json(self):
+        import json as _json
+        rc, output = self._run(["scan", str(FIXTURE), "--format", "json"])
+        self.assertEqual(rc, 1)
+        payload = _json.loads(output)
+        self.assertEqual(payload[0]["rule_id"], "aws-access-key-id")
 
 
 class FalsePositiveTests(unittest.TestCase):
