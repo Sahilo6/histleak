@@ -80,7 +80,7 @@ object database -- it just stops being reachable from `HEAD`'s tree. No tree wal
 parses each tree, and records the earliest commit + path each flagged blob appeared under. Since
 real repos have very few findings, an expensive walk over a small set is cheap in practice.
 
-Detection is a table of ~20 structural rules (AWS, Stripe, GitHub, Slack, Google, OpenAI,
+Detection is a table of 15 structural rules (AWS, Stripe, GitHub, Slack, Google, OpenAI,
 Anthropic, JWTs, PEM key blocks, generic key-value assignments, each with a shape validator to
 cut false positives) plus a tuned Shannon-entropy detector for `--severity low`. The entropy
 detector deliberately excludes `-`/`_` from its candidate charset: natural-language slugs and
