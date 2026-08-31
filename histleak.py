@@ -9,6 +9,7 @@ directly: loose objects, packfiles, and delta chains.
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import json
 import math
@@ -17,10 +18,11 @@ import re
 import struct
 import sys
 import zlib
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
+from urllib.parse import unquote
 
 MAX_BLOB_SIZE = 5 * 1024 * 1024  # skip huge blobs, they're binaries or dumps
 
@@ -77,9 +79,45 @@ def parse_object_header(raw: bytes) -> tuple[str, int, bytes]:
     return otype, int(size_s), content
 
 
+class _BoundedCache:
+    """LRU cache holding decompressed object contents.
+
+    The cache exists so that a delta base referenced by many deltas is
+    inflated once rather than once per dependant. It must be bounded: a
+    scan resolves *every* object in the repository, so an unbounded cache
+    holds the entire decompressed repo in memory. Measured on requests'
+    history (27k objects), unbounded peaked at 172MB, which extrapolates
+    to multiple GB on a repo the size of CPython.
+
+    Delta chains have strong locality (a base and its deltas are written
+    near each other in the pack), so a small window retains almost all of
+    the benefit. Large objects are never cached: they are rarely delta
+    bases and dominate memory when they are.
+    """
+
+    def __init__(self, max_entries: int = 2048, max_value_bytes: int = 1 << 20):
+        self._data: OrderedDict = OrderedDict()
+        self._max_entries = max_entries
+        self._max_value_bytes = max_value_bytes
+
+    def get(self, key):
+        value = self._data.get(key)
+        if value is not None:
+            self._data.move_to_end(key)
+        return value
+
+    def put(self, key, value) -> None:
+        if len(value[1]) > self._max_value_bytes:
+            return
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self._max_entries:
+            self._data.popitem(last=False)
+
+
 class ObjectStore:
     """Resolves object ids to (type, content) across loose objects and any
-    number of packfiles, with delta resolution and memoisation."""
+    number of packfiles, with delta resolution and bounded memoisation."""
 
     def __init__(self, git_dir: Path):
         self.git_dir = git_dir
@@ -90,7 +128,7 @@ class ObjectStore:
                 pack_path = idx_path.with_suffix(".pack")
                 if pack_path.is_file():
                     self.packs.append(PackFile(idx_path, pack_path))
-        self._cache: dict[str, tuple[str, bytes]] = {}
+        self._cache = _BoundedCache()
 
     def get(self, sha: str) -> Optional[tuple[str, bytes]]:
         cached = self._cache.get(sha)
@@ -100,12 +138,12 @@ class ObjectStore:
         if raw is not None:
             otype, _size, content = parse_object_header(raw)
             result = (otype, content)
-            self._cache[sha] = result
+            self._cache.put(sha, result)
             return result
         for pack in self.packs:
             result = pack.get(sha, self)
             if result is not None:
-                self._cache[sha] = result
+                self._cache.put(sha, result)
                 return result
         return None
 
@@ -321,7 +359,7 @@ class PackFile:
         self.pack_path = pack_path
         self._fh = open(pack_path, "rb")
         self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
-        self._offset_cache: dict[int, tuple[str, bytes]] = {}
+        self._offset_cache = _BoundedCache()
 
     def __del__(self):
         try:
@@ -375,7 +413,7 @@ class PackFile:
             content = self._inflate_from(pos)
             result = (PACK_TYPE_NAMES[obj_type], content)
 
-        self._offset_cache[offset] = result
+        self._offset_cache.put(offset, result)
         return result
 
     def _inflate_from(self, pos: int) -> bytes:
@@ -420,10 +458,63 @@ def _valid_jwt(token: str) -> bool:
     try:
         for part in parts[:2]:
             pad = "=" * (-len(part) % 4)
-            json.loads(__import__("base64").urlsafe_b64decode(part + pad))
+            json.loads(base64.urlsafe_b64decode(part + pad))
         return True
     except Exception:
         return False
+
+
+# Words that appear as the password in documentation and test URLs. Testing
+# against `requests`' own history, every single basic-auth match in 27k
+# objects was one of these -- "pass", "password", "{ENCODED_PASSWORD}" --
+# and none was a real credential. Without this filter the rule produced
+# 1,960 findings on a clean repository, which is worse than useless: it
+# trains people to ignore the tool.
+_PLACEHOLDER_PASSWORDS = frozenset({
+    "pass", "password", "passwd", "pwd", "secret", "mypassword", "yourpassword",
+    "changeme", "change_me", "user", "username", "token", "apikey", "api_key",
+    "test", "testing", "example", "sample", "demo", "placeholder", "redacted",
+    "hidden", "xxx", "xxxx", "yyy", "zzz", "foo", "bar", "baz", "hunter2",
+    "abc123", "123456", "letmein", "admin", "root", "none", "null", "value",
+})
+
+
+_TEMPLATE_SYNTAX = re.compile(
+    r"\$\{.*?\}"          # ${VAR}
+    r"|\{[^}]*\}"          # {PLACEHOLDER}
+    r"|<[^>]*>"            # <your-password>
+    r"|%\([^)]*\)[sd]"     # %(name)s
+    r"|%[sd]\b"            # %s / %d
+)
+# "$VAR" only counts as a template when it is the whole value. Kept out of
+# the alternation above because "$" there would read as an end anchor and
+# reject any password merely ending in "$something".
+_BARE_SHELL_VAR = re.compile(r"\A\$[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _valid_basic_auth_password(password: str) -> bool:
+    """Reject documentation placeholders in scheme://user:pass@host URLs."""
+    decoded = unquote(password).strip()
+    if len(decoded) < 6:
+        return False
+    # Template syntax, not the individual characters: "$" and "*" are
+    # perfectly ordinary password characters, so only reject them when they
+    # form an actual substitution -- ${VAR}, {PLACEHOLDER}, <your-password>,
+    # %s, %(name)s.
+    if _TEMPLATE_SYNTAX.search(decoded) or _BARE_SHELL_VAR.match(decoded):
+        return False
+    lowered = decoded.lower()
+    if lowered in _PLACEHOLDER_PASSWORDS:
+        return False
+    # "pass pass", "password-password", "pass#pass": a placeholder repeated
+    # or joined by any separator. Split on every non-alphanumeric character
+    # so URL-encoded separators (%23 -> "#") are handled after unquoting.
+    words = re.split(r"[^a-z0-9]+", lowered)
+    if words and all(w in _PLACEHOLDER_PASSWORDS or not w for w in words):
+        return False
+    if len(set(decoded)) <= 2:
+        return False  # "aaaaaa", "abababab"
+    return True
 
 
 @dataclass
@@ -467,7 +558,8 @@ RULES: list[Rule] = [
     Rule("generic-api-key-assignment", "low",
          re.compile(r"(?i)\b(?:api[_-]?key|secret|token|passwd|password)\b\s*[:=]\s*['\"]([A-Za-z0-9_\-/+]{16,})['\"]")),
     Rule("basic-auth-url", "medium",
-         re.compile(r"\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:([^/\s:@]{4,})@")),
+         re.compile(r"\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:([^/\s:@]{4,})@"),
+         _valid_basic_auth_password, group=1),
     Rule("slack-webhook", "medium",
          re.compile(r"(https://hooks\.slack\.com/services/[A-Za-z0-9/]{20,})")),
     Rule("npm-token", "medium",
@@ -516,6 +608,7 @@ class Finding:
     commit_sha: Optional[str] = None
     author: Optional[str] = None
     date: Optional[str] = None
+    occurrences: int = 1  # how many distinct blobs carried this same secret
 
     def redacted(self) -> str:
         m = self.match
@@ -524,14 +617,71 @@ class Finding:
         return m[:4] + "…" + m[-4:]
 
 
-def scan_blob_text(text: str, path: str, blob_sha: str) -> list[Finding]:
-    findings: list[Finding] = []
-    lines = text.split("\n")
-    line_starts = []
-    pos = 0
-    for line in lines:
-        line_starts.append(pos)
-        pos += len(line) + 1
+SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+_MAX_ENTROPY_HITS_PER_BLOB = 25
+
+# PEM armor: the base64 body of a certificate is high-entropy by design and
+# is public data, not a secret. Private keys are caught by the dedicated
+# private-key-block rule, which fires on the BEGIN line itself, so excluding
+# armored bodies from the entropy pass loses no real detection.
+_PEM_BLOCK = re.compile(
+    r"-----BEGIN [A-Z0-9 ]+-----(.*?)-----END [A-Z0-9 ]+-----", re.DOTALL)
+
+
+def _pem_body_ranges(text: str) -> list[tuple[int, int]]:
+    return [(m.start(1), m.end(1)) for m in _PEM_BLOCK.finditer(text)]
+
+
+def scan_blob_text(text: str, path: str, blob_sha: str,
+                   min_severity: str = "low") -> list[Finding]:
+    """Scan one blob's text. Rules below min_severity are skipped rather
+    than run and filtered afterwards, which matters because the entropy
+    pass is the most expensive scan and is only ever low severity."""
+    min_rank = SEVERITY_RANK.get(min_severity, 0)
+
+    # Collect (rule_id, severity, token, offset) first. Line numbers need a
+    # table of line-start offsets, and building that means walking the whole
+    # blob -- wasteful for the overwhelming majority of blobs, which match
+    # nothing at all. Defer it until we know there is something to report.
+    raw_hits: list[tuple[str, str, str, int]] = []
+
+    for rule in RULES:
+        if SEVERITY_RANK[rule.severity] < min_rank:
+            continue
+        for m in rule.pattern.finditer(text):
+            token = m.group(rule.group)
+            if rule.validator and not rule.validator(token):
+                continue
+            raw_hits.append((rule.id, rule.severity, token, m.start()))
+
+    if min_rank == 0:
+        seen = {(token, off) for _, _, token, off in raw_hits}
+        armored = _pem_body_ranges(text)
+        entropy_hits: list[tuple[str, str, str, int]] = []
+        for m in _ENTROPY_CANDIDATE.finditer(text):
+            token = m.group(0)
+            start = m.start()
+            if (token, start) in seen:
+                continue
+            if any(lo <= start < hi for lo, hi in armored):
+                continue
+            if _looks_like_secret(token):
+                entropy_hits.append(("high-entropy-string", "low", token, start))
+        # A file where high-entropy strings dominate is an encoded data file
+        # (a cert bundle, a minified bundle, an embedded image), not source
+        # code with a key in it. Reporting hundreds of lines from one such
+        # file drowns every real finding, so treat density as the signal it
+        # is and drop the whole blob's entropy hits.
+        if len(entropy_hits) <= _MAX_ENTROPY_HITS_PER_BLOB:
+            raw_hits.extend(entropy_hits)
+
+    if not raw_hits:
+        return []
+
+    line_starts = [0]
+    for m in re.finditer(r"\n", text):
+        line_starts.append(m.end())
 
     def line_of(offset: int) -> int:
         lo, hi = 0, len(line_starts) - 1
@@ -543,24 +693,8 @@ def scan_blob_text(text: str, path: str, blob_sha: str) -> list[Finding]:
                 hi = mid - 1
         return lo + 1
 
-    for rule in RULES:
-        for m in rule.pattern.finditer(text):
-            token = m.group(rule.group)
-            if rule.validator and not rule.validator(token):
-                continue
-            findings.append(Finding(rule.id, rule.severity, token, path,
-                                     line_of(m.start()), blob_sha))
-
-    seen_spans = {(f.match, f.line) for f in findings}
-    for m in _ENTROPY_CANDIDATE.finditer(text):
-        token = m.group(0)
-        key = (token, line_of(m.start()))
-        if key in seen_spans:
-            continue
-        if _looks_like_secret(token):
-            findings.append(Finding("high-entropy-string", "low", token, path,
-                                     line_of(m.start()), blob_sha))
-    return findings
+    return [Finding(rule_id, severity, token, path, line_of(off), blob_sha)
+            for rule_id, severity, token, off in raw_hits]
 
 
 # ============================================================
@@ -688,8 +822,6 @@ def scan_repository(repo_path: str, min_severity: str = "low") -> list[Finding]:
     store = ObjectStore(git_dir)
     ignore_patterns = load_ignore_patterns(repo_root)
 
-    severity_rank = {"low": 0, "medium": 1, "high": 2}
-    min_rank = severity_rank.get(min_severity, 0)
 
     findings_by_blob: dict[str, list[Finding]] = {}
     for sha in store.iter_all_shas():
@@ -704,8 +836,8 @@ def scan_repository(repo_path: str, min_severity: str = "low") -> list[Finding]:
         if is_binary_blob(content):
             continue
         text = content.decode("utf-8", errors="replace")
-        blob_findings = scan_blob_text(text, path="", blob_sha=sha)
-        blob_findings = [f for f in blob_findings if severity_rank[f.severity] >= min_rank]
+        blob_findings = scan_blob_text(text, path="", blob_sha=sha,
+                                        min_severity=min_severity)
         if blob_findings:
             findings_by_blob[sha] = blob_findings
 
@@ -725,8 +857,35 @@ def scan_repository(repo_path: str, min_severity: str = "low") -> list[Finding]:
                 f.date = info["date"]
             all_findings.append(f)
 
-    all_findings.sort(key=lambda f: (-severity_rank[f.severity], f.path, f.line))
+    all_findings = _deduplicate(all_findings)
+    all_findings.sort(key=lambda f: (-SEVERITY_RANK[f.severity], f.path, f.line))
     return all_findings
+
+
+def _deduplicate(findings: list[Finding]) -> list[Finding]:
+    """Collapse the same secret found in many historical versions of a file.
+
+    Every commit that touched a file creates a new blob, so a secret that
+    survived twenty commits is twenty distinct blobs carrying identical
+    content. Reporting each one separately buries the signal: what the user
+    needs is "this secret is in this file, first introduced here, and it
+    persisted across N versions."
+    """
+    grouped: dict[tuple, Finding] = {}
+    for f in findings:
+        key = (f.rule_id, f.match, f.path, f.line)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = f
+            continue
+        existing.occurrences += 1
+        # Keep the earliest attribution: that is when the leak was introduced.
+        if f.date and (existing.date is None or f.date < existing.date):
+            existing.commit_sha = f.commit_sha
+            existing.author = f.author
+            existing.date = f.date
+            existing.blob_sha = f.blob_sha
+    return list(grouped.values())
 
 
 # ============================================================
@@ -746,7 +905,8 @@ def print_text_report(findings: list[Finding], repo_path: str) -> None:
         commit = f.commit_sha[:8] if f.commit_sha else "unknown"
         when = f" ({f.date})" if f.date else ""
         print(f"  {SEVERITY_LABEL[f.severity]}  {f.rule_id:<28} {loc}")
-        print(f"        commit {commit}{when}  blob {f.blob_sha[:10]}")
+        versions = f" across {f.occurrences} versions" if f.occurrences > 1 else ""
+        print(f"        first seen in commit {commit}{when}{versions}")
         print(f"        {f.redacted()}")
     print(f"\n{len(findings)} finding(s). "
           f"Use `git log --all --oneline | grep <commit>` to inspect, "
@@ -761,6 +921,7 @@ def findings_to_json(findings: list[Finding]) -> list[dict]:
         "path": f.path,
         "line": f.line,
         "blob_sha": f.blob_sha,
+        "occurrences": f.occurrences,
         "commit_sha": f.commit_sha,
         "author": f.author,
         "date": f.date,

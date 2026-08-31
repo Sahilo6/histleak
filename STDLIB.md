@@ -16,9 +16,12 @@ replaced it. All from Python 3's stdlib, no third-party runtime dependency anywh
 | entropy-check libraries (e.g. `password-strength`) | `math.log2` + `collections.Counter` for Shannon entropy, from first principles | `shannon_entropy()` |
 | `pyinstaller` / `shiv` | `zipapp`-style packaging done by hand through `zipfile`, with pinned `ZipInfo` timestamps for reproducibility (`python3 -m zipapp` alone is not reproducible: it stamps the current time) | `build_reproducible.py` |
 | `pathspec` (gitignore-style matching) | `fnmatch`, sufficient for the flat glob patterns `.histleakignore` supports | `scan_repository()` |
-| `tqdm` | Not used; scans complete in well under a second on real repos (1184 objects in ~90ms during development testing), so a progress bar would be noise, not signal | n/a |
+| `tqdm` | Not used. A scan is a single pass with a known object count, so progress would be trivial to print, but at ~17s for a 27k-object repo it finishes before a bar earns its screen space. Documented as a deliberate omission rather than an oversight | n/a |
 | `python-dateutil` | `datetime` with explicit Unix-timestamp + timezone parsing of git's `author <ts> <tz>` line format | `parse_commit()` |
 | `pydantic` / `attrs` | `dataclasses.dataclass` for the `Rule` and `Finding` structures | `# --- detection ---`, `# --- report ---` |
+| `urllib3` / manual percent-decoding | `urllib.parse.unquote`, to decode URL-encoded passwords before checking them against the placeholder list (`pass%23pass` -> `pass#pass`) | `_valid_basic_auth_password()` |
+| `cachetools` (`LRUCache`) | `collections.OrderedDict` with `move_to_end` + `popitem(last=False)`, which is all an LRU actually needs | `_BoundedCache` |
+| `pyjwt` | `base64.urlsafe_b64decode` + `json.loads` to structurally validate a JWT's header and payload without verifying its signature (we only need to know it is a real JWT, not a valid one) | `_valid_jwt()` |
 
 ## Disclosed dev-time use of `git`
 

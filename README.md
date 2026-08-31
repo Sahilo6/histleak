@@ -36,7 +36,7 @@ $ python3 histleak.py scan tests/fixtures/packed_git
 histleak: 1 finding(s) in tests/fixtures/packed_git
 
   HIGH  aws-access-key-id            config/prod.env:1
-        commit 892dd7d9 (2024-01-01T18:30:00+00:00)  blob f12c1cb85c
+        first seen in commit 892dd7d9 (2024-01-01T18:30:00+00:00)
         AKIA…0001
 
 1 finding(s). Use `git log --all --oneline | grep <commit>` to inspect, or add a glob to .histleakignore to suppress.
@@ -100,10 +100,10 @@ built by hand through `zipfile` with a fixed timestamp on every entry instead of
 
 ```
 $ ./build.sh && ./build.sh
-wrote dist/histleak.pyz (9140 bytes)
-wrote dist/histleak.pyz (9140 bytes)
-409e35eaf59d52e680fe74db81b33917823e020fdb9bc2b317952ce15728c0b6  dist/histleak.pyz
-409e35eaf59d52e680fe74db81b33917823e020fdb9bc2b317952ce15728c0b6  dist/histleak.pyz
+wrote dist/histleak.pyz (11876 bytes)
+wrote dist/histleak.pyz (11876 bytes)
+c78961e97c926c3c435d0350a7cd81ec1592a91fb9025418ebb3a0cccf3790c4  dist/histleak.pyz
+c78961e97c926c3c435d0350a7cd81ec1592a91fb9025418ebb3a0cccf3790c4  dist/histleak.pyz
 ```
 
 ## Tests
@@ -112,10 +112,44 @@ wrote dist/histleak.pyz (9140 bytes)
 python3 -m unittest -v
 ```
 
-20 tests, no network, no `git` invoked at test time. `tests/fixtures/packed_git/` is a
+32 tests, no network, no `git` invoked at test time. `tests/fixtures/packed_git/` is a
 pre-built, `git gc`'d bare repo committed as test data -- see `tests/fixtures/README.md` for
 exactly how it was built and what it plants. `git` was used once, by a human, to build that
 fixture. It is never called by `histleak.py` or by the tests.
+
+## Scale and accuracy
+
+Measured on [psf/requests](https://github.com/psf/requests) full history, 26,859 objects:
+
+| | Default (`--severity medium`) | `--severity low` |
+|---|---|---|
+| Findings | 4 | 13 |
+| False positives | 0 | 0 |
+| Time | ~17s | ~21s |
+| Peak memory | 87MB | 87MB |
+
+All 4 default findings are real private keys in `tests/certs/`, committed intentionally as test
+fixtures. `histleak` is correct to flag them; a user would add them to `.histleakignore`.
+
+Getting there took four fixes that only a repo this size revealed, each now covered by a
+regression test:
+
+- **Placeholder credentials.** `http://user:pass@host` in documentation produced **1,960**
+  findings. Every basic-auth match in requests' entire history was a placeholder, not a
+  credential, so the rule now validates the password against a placeholder list and template
+  syntax (`${VAR}`, `{PLACEHOLDER}`, `<your-password>`).
+- **Certificate bundles.** `requests/cacert.pem` produced **19,328** entropy findings on its own.
+  A certificate's base64 body is high-entropy by design and is public data, so PEM-armored
+  bodies are excluded from the entropy pass. Private keys still fire, because that rule matches
+  the `BEGIN` line itself.
+- **Encoded data files.** Any blob where entropy hits dominate is an encoded artifact, not source
+  with a key in it, so its entropy hits are dropped wholesale.
+- **Unbounded caching.** The object cache held every decompressed object in the repo, peaking at
+  172MB on 27k objects and extrapolating to multiple GB on something CPython-sized. It is now a
+  bounded LRU, which cut peak memory roughly in half with no loss of delta-resolution speed.
+
+Findings are also deduplicated: a secret that survived twenty commits is twenty distinct blobs
+with identical content, reported once as "first seen in commit X across N versions."
 
 ## Limitations
 
@@ -126,6 +160,8 @@ fixture. It is never called by `histleak.py` or by the tests.
 - Commit attribution finds the earliest commit that introduced a flagged blob at some path. If
   the same secret content was independently added under multiple paths, only the first is
   reported per blob.
+- Detection runs on blob content before paths are known, so rules cannot currently be scoped by
+  file extension. The density guard covers the cases where that would have helped.
 
 ## Zero-dependency proof
 

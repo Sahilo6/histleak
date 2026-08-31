@@ -115,7 +115,7 @@ def _resolve_at(self, offset, store):
     if cached is not None:
         return cached
     # ... resolve ...
-    self._offset_cache[offset] = result
+    self._offset_cache.put(offset, result)
     return result
 ```
 
@@ -133,3 +133,42 @@ never actually leaves the object database. It just stops being reachable from th
 None of that required understanding git's *history model* at all. It only required correctly
 reading the *object store*, which turned out to be the harder and more interesting problem, and
 the one no `pip install` was going to solve for me this weekend.
+
+## Postscript: the bugs that only a big repository had
+
+Everything above was true when the scanner worked on a 1,200-object repo. I then pointed it at
+`requests`' full history, 26,859 objects, and it reported **1,968 findings on a clean codebase**.
+
+Not one was a real credential.
+
+1,960 came from a single rule matching `http://user:pass@host` in documentation. When I dumped
+the actual matched values, the entire distribution was five strings: `pass`, `password`,
+`pass%20pass`, `pass%23pass`, `{ENCODED_PASSWORD}`. A scanner that reports two thousand
+documentation examples is worse than no scanner, because it teaches its user to ignore it.
+
+Then, with `--severity low`, the entropy detector produced 20,166 findings, of which 19,328 came
+from one file: `requests/cacert.pem`. Every base64 line of a certificate is high-entropy. That is
+what a certificate *is*. It is also completely public.
+
+Both fixes were about the same thing: entropy measures randomness, and randomness is not
+secrecy. A CA bundle is maximally random and perfectly public. The word "password" is minimally
+random and, in a docs example, equally harmless. Neither can be separated from a real key by any
+threshold on the entropy formula, because the formula does not encode the distinction I actually
+care about. The filters that worked were structural: is this token inside PEM armor, is this
+password one of the words people write when they mean "your password here," does entropy
+*dominate* this file rather than appear once in it.
+
+There was also a memory bug I would not have found any other way. My object cache was unbounded,
+which is invisible at 1,200 objects and peaked at 172MB at 27,000. Extrapolated to something
+CPython-sized it would have been multiple gigabytes, and the tool would have simply died on the
+repositories most worth scanning. Bounding it to an LRU window cost nothing measurable, because
+delta chains have strong locality: the base you need next is almost always one you touched
+recently.
+
+Final numbers on that same repository: **4 findings, all true positives** (real private keys in
+`tests/certs/`), 17 seconds, 87MB peak.
+
+The general lesson is the one I keep relearning. A tool that is correct on your fixture is not
+finished, it is *untested*. The fixture cannot contain the thing you failed to anticipate,
+because you built the fixture out of what you already anticipated. Every single one of these
+bugs was found by pointing the thing at reality and being willing to read what it actually said.
